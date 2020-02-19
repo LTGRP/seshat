@@ -34,7 +34,7 @@ pub use crate::database::connection::{Connection, DatabaseStats};
 pub use crate::database::searcher::{SearchResult, Searcher};
 use crate::database::writer::Writer;
 use crate::error::{Error, Result};
-use crate::events::{CrawlerCheckpoint, Event, HistoricEventsT, Profile};
+use crate::events::{CrawlerCheckpoint, Event, EventId, HistoricEventsT, Profile};
 use crate::index::{Index, Writer as IndexWriter};
 
 #[cfg(test)]
@@ -47,7 +47,7 @@ use tempfile::tempdir;
 #[cfg(test)]
 use crate::events::CheckpointDirection;
 #[cfg(test)]
-use crate::EVENT;
+use crate::{EVENT, TOPIC_EVENT};
 
 const DATABASE_VERSION: i64 = 2;
 
@@ -55,6 +55,7 @@ pub(crate) enum ThreadMessage {
     Event((Event, Profile)),
     HistoricEvents(HistoricEventsT),
     Write(Sender<Result<()>>, bool),
+    Delete(Sender<Result<bool>>, EventId),
 }
 
 /// The Seshat database.
@@ -222,21 +223,21 @@ impl Database {
 
         let t_handle = thread::spawn(move || {
             let mut writer = Writer::new(connection, index_writer);
-            let mut loaded_uncommitted = false;
+            let mut loaded_unprocessed = false;
 
             while let Ok(message) = rx.recv() {
                 match message {
                     ThreadMessage::Event((event, profile)) => writer.add_event(event, profile),
                     ThreadMessage::Write(sender, force_commit) => {
-                        // We may have events that aren't committed to the index
-                        // but are stored in the db, let us load them from the
-                        // db and commit them to the index now. They will later
-                        // be marked as committed in the database as part of a
-                        // normal write.
-                        if !loaded_uncommitted {
-                            let ret = writer.load_uncommitted_events();
+                        // We may have events that aren't deleted or committed
+                        // to the index but are stored in the db, let us load
+                        // them from the db and commit them to the index now.
+                        // They will later be marked as committed in the
+                        // database as part of a normal write.
+                        if !loaded_unprocessed {
+                            let ret = writer.load_unprocessed_events();
 
-                            loaded_uncommitted = true;
+                            loaded_unprocessed = true;
 
                             if ret.is_err() {
                                 sender.send(ret).unwrap_or(());
@@ -250,6 +251,10 @@ impl Database {
                     ThreadMessage::HistoricEvents(m) => {
                         let (check, old_check, events, sender) = m;
                         let ret = writer.write_historic_events(check, old_check, events, true);
+                        sender.send(ret).unwrap_or(());
+                    }
+                    ThreadMessage::Delete(sender, event_id) => {
+                        let ret = writer.delete_event(event_id);
                         sender.send(ret).unwrap_or(());
                     }
                 };
@@ -271,6 +276,22 @@ impl Database {
     pub fn add_event(&self, event: Event, profile: Profile) {
         let message = ThreadMessage::Event((event, profile));
         self.tx.send(message).unwrap();
+    }
+
+    /// Delete an event from the database.
+    ///
+    /// # Arguments
+    /// * `event_id` - The event id of the event that will be deleted.
+    ///
+    /// Note for the event to be completely removed a commit needs to be done.
+    ///
+    /// Returns a receiver that will receive an empty message once the event has
+    /// been deleted.
+    pub fn delete_event(&self, event_id: &str) -> Receiver<Result<bool>> {
+        let (sender, receiver): (_, Receiver<Result<bool>>) = channel();
+        let message = ThreadMessage::Delete(sender, event_id.to_owned());
+        self.tx.send(message).unwrap();
+        receiver
     }
 
     fn commit_helper(&mut self, force: bool) -> Receiver<Result<()>> {
@@ -860,4 +881,48 @@ fn stats_getting() {
     assert_eq!(stats.event_count, 1000);
     assert_eq!(stats.room_count, 1);
     assert!(stats.size > 0);
+}
+
+#[test]
+fn delete_an_event() {
+    let tmpdir = tempdir().unwrap();
+    let mut db = Database::new(tmpdir.path()).unwrap();
+    let profile = Profile::new("Alice", "");
+
+    db.add_event(EVENT.clone(), profile.clone());
+    db.add_event(TOPIC_EVENT.clone(), profile);
+
+    db.force_commit().unwrap();
+
+    assert!(Database::load_undeleted_events(&db.connection)
+        .unwrap()
+        .is_empty());
+
+    let recv = db.delete_event(&EVENT.event_id);
+    recv.recv().unwrap().unwrap();
+
+    assert_eq!(
+        Database::load_undeleted_events(&db.connection)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    drop(db);
+
+    let mut db = Database::new(tmpdir.path()).unwrap();
+    assert_eq!(
+        Database::load_undeleted_events(&db.connection)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    db.force_commit().unwrap();
+    assert_eq!(
+        Database::load_undeleted_events(&db.connection)
+            .unwrap()
+            .len(),
+        0
+    );
 }

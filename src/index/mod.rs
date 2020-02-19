@@ -22,6 +22,7 @@ use std::path::Path;
 use std::time::Duration;
 use tantivy as tv;
 use tantivy::tokenizer::Tokenizer;
+use tantivy::Term;
 
 use crate::config::{Config, Language, SearchConfig};
 use crate::events::{Event, EventId, EventType};
@@ -67,7 +68,7 @@ const COMMIT_TIME: Duration = Duration::from_secs(5);
 use tempfile::TempDir;
 
 #[cfg(test)]
-use crate::events::{EVENT, JAPANESE_EVENTS};
+use crate::events::{EVENT, JAPANESE_EVENTS, TOPIC_EVENT};
 
 pub(crate) struct Index {
     index: tv::Index,
@@ -129,6 +130,13 @@ impl Writer {
 
         self.inner.add_document(doc);
         self.added_events += 1;
+    }
+
+    /// Delete the event with the given event id from the index.
+    pub fn delete_event(&mut self, event_id: &str) {
+        let term = Term::from_field_text(self.event_id_field, &event_id);
+        self.inner.delete_term(term);
+        self.inner.commit().unwrap();
     }
 }
 
@@ -214,9 +222,11 @@ impl Index {
         let body_field = schemabuilder.add_text_field("body", text_field_options.clone());
         let topic_field = schemabuilder.add_text_field("topic", text_field_options.clone());
         let name_field = schemabuilder.add_text_field("name", text_field_options);
-        let room_id_field = schemabuilder.add_text_field("room_id", tv::schema::STRING);
+        let room_id_field =
+            schemabuilder.add_text_field("room_id", tv::schema::STORED | tv::schema::STRING);
 
-        let event_id_field = schemabuilder.add_text_field("event_id", tv::schema::STORED);
+        let event_id_field =
+            schemabuilder.add_text_field("event_id", tv::schema::STORED | tv::schema::STRING);
 
         let schema = schemabuilder.build();
 
@@ -323,7 +333,9 @@ impl Index {
 
     pub fn get_writer(&self) -> Result<Writer, tv::Error> {
         Ok(Writer {
-            inner: self.index.writer_with_num_threads(1, TANTIVY_WRITER_HEAP_SIZE)?,
+            inner: self
+                .index
+                .writer_with_num_threads(1, TANTIVY_WRITER_HEAP_SIZE)?,
             body_field: self.body_field,
             topic_field: self.topic_field,
             name_field: self.name_field,
@@ -452,4 +464,35 @@ fn event_count() {
 
     writer.force_commit().unwrap();
     assert_eq!(writer.added_events, 0);
+}
+
+#[test]
+fn delete_an_event() {
+    let tmpdir = TempDir::new().unwrap();
+    let config = Config::new().set_language(&Language::English);
+    let index = Index::new(&tmpdir, &config).unwrap();
+
+    let mut writer = index.get_writer().unwrap();
+
+    writer.add_event(&EVENT);
+    writer.add_event(&TOPIC_EVENT);
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+    let result = searcher.search("Test", &Default::default()).unwrap();
+
+    let event_id = &EVENT.event_id;
+
+    assert_eq!(result.len(), 2);
+    assert_eq!(&result[0].1, event_id);
+
+    writer.delete_event(event_id);
+    writer.force_commit().unwrap();
+    index.reload().unwrap();
+
+    let searcher = index.get_searcher();
+    let result = searcher.search("Test", &Default::default()).unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(&result[0].1, &TOPIC_EVENT.event_id);
 }
