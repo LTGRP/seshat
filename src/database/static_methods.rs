@@ -44,6 +44,8 @@ impl Database {
         let mut ret = Vec::new();
         let mut event_ids = Vec::new();
 
+        let room_id = events.get(0).map(|e| &e.0.room_id).cloned();
+
         for (mut e, mut p) in events.drain(..) {
             let event_id = Database::save_event(&connection, &mut e, &mut p)?;
             match event_id {
@@ -58,6 +60,9 @@ impl Database {
                 }
             }
         }
+
+        println!("Added historic events for room {:?}, events already added {}",
+                 room_id, ret.iter().all(|&x| x));
 
         Ok((ret.iter().all(|&x| x), event_ids))
     }
@@ -161,6 +166,8 @@ impl Database {
     ) -> Result<(bool, bool)> {
         let (new_checkpoint, old_checkpoint, mut events) = message;
         let transaction = connection.transaction()?;
+
+        println!("Adding events for checkpoint {:?}", old_checkpoint);
 
         let (ret, event_ids) =
             Database::write_events_helper(&transaction, index_writer, &mut events)?;
